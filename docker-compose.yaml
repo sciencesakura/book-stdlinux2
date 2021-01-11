@@ -1,0 +1,7 @@
+version: "3.9"
+services:
+  xinetd:
+    build: ./docker/xinetd
+    ports:
+      - "7:7"   # echo protocol
+      - "13:13" # daytime protocol
