@@ -1,4 +1,5 @@
 #include <ctype.h>
+#include <fcntl.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdbool.h>
@@ -7,7 +8,12 @@
 #include <stdnoreturn.h>
 #include <string.h>
 #include <sys/errno.h>
+#include <sys/stat.h>
+#include <time.h>
+#include <unistd.h>
 
+#define SERVER_NAME                "httpd"
+#define SERVER_VER                 "1.0"
 #define MAX_REQUEST_CONTENT_LENGTH 4096 * 4096
 #define HTTP_VERSION_PREFIX        "HTTP/1."
 
@@ -24,6 +30,12 @@ struct HttpRequest {
   struct HttpHeaderField *headers;
   long length;
   char *body;
+};
+
+struct FileInfo {
+  char *path;
+  long size;
+  bool exists;
 };
 
 static noreturn void log_exit(const char *restrict fmt, ...)
@@ -70,36 +82,26 @@ static void read_request_line(struct HttpRequest *req, FILE *in)
   if (!fgets(buf, sizeof(buf), in)) {
     log_exit("fgets(3) failed");
   }
-  char *p = buf;
-  char *ss[3];
-  int idx = 0;
-  int len = 0;
-  while (true) {
-    if (!*p || isspace(*p)) {
-      if (len != 0) {
-        if (idx == 3) {
-          log_exit("parse error on read_request_line: %s", buf);
-        }
-        ss[idx] = malloc(len + 1);
-        memcpy(ss[idx], p - len, len);
-        ss[idx++][len] = '\0';
-        len = 0;
-      }
-      if (!*p)
-        break;
-    } else {
-      len++;
-    }
-    p++;
-  }
-  upcase(ss[0]);
-  req->method = ss[0];
-  req->path = ss[1];
-  if (strncasecmp(ss[2], HTTP_VERSION_PREFIX, sizeof(HTTP_VERSION_PREFIX) - 1) != 0) {
+  char *p = strchr(buf, ' ');
+  if (!p) {
     log_exit("parse error on read_request_line: %s", buf);
   }
-  req->protocol_minor_version = atoi(ss[2] + sizeof(HTTP_VERSION_PREFIX) - 1);
-  free(ss[2]);
+  *p++ = '\0';
+  req->method = malloc(p - buf);
+  strcpy(req->method, buf);
+  upcase(req->method);
+  char *path = p;
+  p = strchr(path, ' ');
+  if (!p) {
+    log_exit("parse error on read_request_line: %s", path);
+  }
+  *p++ = '\0';
+  req->path = malloc(p - path);
+  strcpy(req->path, path);
+  if (strncasecmp(p, HTTP_VERSION_PREFIX, sizeof(HTTP_VERSION_PREFIX) - 1) != 0) {
+    log_exit("parse error on read_request_line: %s", p);
+  }
+  req->protocol_minor_version = atoi(p + sizeof(HTTP_VERSION_PREFIX) - 1);
 }
 
 static int split(char *s, char c)
@@ -128,12 +130,6 @@ static char *trim(char *s)
   return s;
 }
 
-static void mallocpy(char **restrict dest, const char *restrict src)
-{
-  *dest = malloc(strlen(src) + 1);
-  strcpy(*dest, src);
-}
-
 static struct HttpHeaderField *read_header_field(FILE *in)
 {
   char buf[1024];
@@ -148,12 +144,14 @@ static struct HttpHeaderField *read_header_field(FILE *in)
   char *value = trim(buf + strlen(buf) + 1);
   char *name = trim(buf);
   struct HttpHeaderField *f = malloc(sizeof(struct HttpHeaderField));
-  mallocpy(&f->name, name);
-  mallocpy(&f->value, value);
+  f->name = malloc(strlen(name) + 1);
+  strcpy(f->name, name);
+  f->value = malloc(strlen(value) + 1);
+  strcpy(f->value, value);
   return f;
 }
 
-static char *lookup_header(struct HttpHeaderField *headers, const char *name)
+static char *lookup_header(struct HttpHeaderField *restrict headers, const char *restrict name)
 {
   for (struct HttpHeaderField *h = headers; h; h = h->next) {
     if (strcasecmp(h->name, name) == 0)
@@ -190,23 +188,147 @@ static struct HttpRequest *read_request(FILE *in)
 
 static void log_request(const struct HttpRequest *req)
 {
-  printf("HttpRequest {\n");
-  printf("  protocol_minor_version: %d\n", req->protocol_minor_version);
-  printf("  method: %s\n", req->method);
-  printf("  path: %s\n", req->path);
-  printf("  headers: [\n");
+  fprintf(stderr, "HttpRequest {\n");
+  fprintf(stderr, "  protocol_minor_version: %d\n", req->protocol_minor_version);
+  fprintf(stderr, "  method: %s\n", req->method);
+  fprintf(stderr, "  path: %s\n", req->path);
+  fprintf(stderr, "  headers: [\n");
   for (struct HttpHeaderField *f = req->headers; f; f = f->next) {
-    printf("    {name: %s, value: %s}\n", f->name, f->value);
+    fprintf(stderr, "    {name: %s, value: %s}\n", f->name, f->value);
   }
-  printf("  ]\n");
-  printf("  length: %ld\n", req->length);
+  fprintf(stderr, "  ]\n");
+  fprintf(stderr, "  length: %ld\n", req->length);
   if (req->body != NULL)
-    printf("  body: %s\n", req->body);
-  printf("}\n");
+    fprintf(stderr, "  body: %s\n", req->body);
+  fprintf(stderr, "}\n");
 }
 
-static void respond_to(struct HttpRequest *req, FILE *out, const char *docroot)
+static struct FileInfo *get_fileinfo(const char *restrict docroot, const char *restrict urlpath)
 {
+  struct FileInfo *fi = malloc(sizeof(struct FileInfo));
+  fi->path = malloc(strlen(docroot) + strlen(urlpath) + 2);
+  sprintf(fi->path, "%s/%s", docroot, urlpath);
+  fi->size = 0;
+  fi->exists = false;
+  struct stat st;
+  if (lstat(fi->path, &st) < 0 || !S_ISREG(st.st_mode))
+    return fi;
+  fi->size = st.st_size;
+  fi->exists = true;
+  return fi;
+}
+
+static void free_fileinfo(struct FileInfo *fi)
+{
+  free(fi->path);
+  free(fi);
+}
+
+static void output_common_headers(const struct HttpRequest *restrict req, FILE *restrict out,
+                                  const char *restrict status)
+{
+  time_t t = time(NULL);
+  struct tm *tm = gmtime(&t);
+  if (!tm) {
+    log_exit("gmtime(3) failed");
+  }
+  char date[30];
+  strftime(date, sizeof(date), "%a, %d %b %Y %H:%M:%S GMT", tm);
+  fprintf(out, "HTTP/1.%d %s\r\n", req->protocol_minor_version, status);
+  fprintf(out, "Date: %s\r\n", date);
+  fprintf(out, "Server: %s/%s\r\n", SERVER_NAME, SERVER_VER);
+  fprintf(out, "Connection: close\r\n");
+}
+
+static char *guess_content_type(const struct FileInfo *fi)
+{
+  return "text/plain";
+}
+
+static void not_found(const struct HttpRequest *req, FILE *out)
+{
+  output_common_headers(req, out, "404 Not Found");
+  fprintf(out, "Content-Type: text/html\r\n");
+  fprintf(out, "\r\n");
+  if (strcmp(req->method, "HEAD") == 0)
+    return;
+  fprintf(out, "<!DOCTYPE html>\n");
+  fprintf(out, "<html>");
+  fprintf(out, "<head><title>Not Found</title></head>");
+  fprintf(out, "<body><h1>404: Not Found</h1></body>");
+  fprintf(out, "</html>\n");
+}
+
+static void do_file_response(const struct HttpRequest *restrict req, FILE *restrict out,
+                             const char *restrict docroot)
+{
+  struct FileInfo *fi = get_fileinfo(docroot, req->path);
+  if (!fi->exists) {
+    free_fileinfo(fi);
+    not_found(req, out);
+    return;
+  }
+  output_common_headers(req, out, "200 OK");
+  fprintf(out, "Content-Length: %ld\r\n", fi->size);
+  fprintf(out, "Content-Type: %s\r\n", guess_content_type(fi));
+  fprintf(out, "\r\n");
+  if (strcmp(req->method, "HEAD") != 0) {
+    int fd = open(fi->path, O_RDONLY);
+    if (fd < 0) {
+      log_exit("open(2) failed: %s", strerror(errno));
+    }
+    char buf[4096];
+    ssize_t n;
+    while ((n = read(fd, buf, sizeof(buf))) != 0) {
+      if (n < 0) {
+        log_exit("read(2) failed: %s", strerror(errno));
+      }
+      if (fwrite(buf, 1, n, out) < n) {
+        log_exit("write(3) failed");
+      }
+    }
+    close(fd);
+  }
+  free_fileinfo(fi);
+}
+
+static void method_not_allowed(const struct HttpRequest *req, FILE *out)
+{
+  output_common_headers(req, out, "405 Method Not Allowed");
+  fprintf(out, "Content-Type: text/html\r\n");
+  fprintf(out, "\r\n");
+  fprintf(out, "<!DOCTYPE html>\n");
+  fprintf(out, "<html>");
+  fprintf(out, "<head><title>Method Not Allowed</title></head>");
+  fprintf(out, "<body><h1>405: Method Not Allowed</h1></body>");
+  fprintf(out, "</html>\n");
+}
+
+static void not_implemented(const struct HttpRequest *req, FILE *out)
+{
+  output_common_headers(req, out, "501 Not Implemented");
+  fprintf(out, "Content-Type: text/html\r\n");
+  fprintf(out, "\r\n");
+  fprintf(out, "<!DOCTYPE html>\n");
+  fprintf(out, "<html>");
+  fprintf(out, "<head><title>Not Implemented</title></head>");
+  fprintf(out, "<body><h1>501: Not Implemented</h1></body>");
+  fprintf(out, "</html>\n");
+}
+
+static void respond_to(const struct HttpRequest *restrict req, FILE *restrict out,
+                       const char *restrict docroot)
+{
+  if (strcmp(req->method, "GET") == 0) {
+    do_file_response(req, out, docroot);
+  } else if (strcmp(req->method, "HEAD") == 0) {
+    do_file_response(req, out, docroot);
+  } else if (strcmp(req->method, "POST") == 0) {
+    method_not_allowed(req, out);
+  } else {
+    not_implemented(req, out);
+  }
+  fflush(out);
 }
 
 static void free_request(struct HttpRequest *req)
