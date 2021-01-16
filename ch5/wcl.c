@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdnoreturn.h>
+#include <sys/types.h>
 #include <unistd.h>
 
 #define BUF_SIZE 2048
@@ -22,7 +23,7 @@ static uint_fast64_t do_wcl(int fd)
   unsigned char buf[BUF_SIZE];
   while ((n = read(fd, buf, sizeof(buf))) != 0) {
     if (n < 0) {
-      exit(EXIT_FAILURE);
+      die(NULL);
     }
     for (ssize_t i = 0; i < n; i++) {
       if (buf[i] == '\n')
@@ -50,7 +51,9 @@ int main(int argc, char *argv[])
         die(argv[i]);
       }
     }
-    printf("%4" PRIuFAST64 " total\n", tot);
+    if (2 < argc) {
+      printf("%4" PRIuFAST64 " total\n", tot);
+    }
   }
   return EXIT_SUCCESS;
 }
