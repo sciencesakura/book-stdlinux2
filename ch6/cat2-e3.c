@@ -15,14 +15,13 @@ static noreturn void die(const char *s)
 static void do_cat(FILE *f)
 {
   unsigned char buf[BUF_SIZE];
-  while (true) {
-    size_t n = fread(buf, 1, sizeof(buf), f);
+  size_t n;
+  do {
+    n = fread(buf, 1, sizeof(buf), f);
     if (ferror(f) || fwrite(buf, 1, n, stdout) < n) {
       die(NULL);
     }
-    if (n < sizeof(buf))
-      break;
-  }
+  } while (n == sizeof(buf));
 }
 
 int main(int argc, char *argv[])

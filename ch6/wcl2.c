@@ -43,7 +43,9 @@ int main(int argc, char *argv[])
         die(argv[i]);
       }
     }
-    printf("%4" PRIuFAST64 " total\n", tot);
+    if (2 < argc) {
+      printf("%4" PRIuFAST64 " total\n", tot);
+    }
   }
   return EXIT_SUCCESS;
 }

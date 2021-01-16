@@ -15,16 +15,10 @@ static void do_cat(FILE *f)
     int rs;
     switch (c) {
     case '\t':
-      rs = putchar('\\');
-      if (rs != EOF) {
-        rs = putchar('t');
-      }
+      rs = fputs("\\t", stdout);
       break;
     case '\n':
-      rs = putchar('$');
-      if (rs != EOF) {
-        rs = putchar(c);
-      }
+      rs = fputs("$\n", stdout);
       break;
     default:
       rs = putchar(c);
