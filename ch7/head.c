@@ -14,6 +14,7 @@ static void do_head(FILE *f, long n)
   int c;
   while ((c = fgetc(f)) != EOF) {
     if (putchar(c) == EOF) {
+      perror(NULL);
       exit(EXIT_FAILURE);
     }
     if (c == '\n' && --n == 0)
