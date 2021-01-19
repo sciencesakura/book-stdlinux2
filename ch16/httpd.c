@@ -1,5 +1,6 @@
 #include <ctype.h>
 #include <fcntl.h>
+#include <netdb.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdbool.h>
@@ -8,14 +9,19 @@
 #include <stdnoreturn.h>
 #include <string.h>
 #include <sys/errno.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/types.h>
+#include <syslog.h>
 #include <time.h>
 #include <unistd.h>
 
 #define SERVER_NAME                "httpd"
 #define SERVER_VER                 "1.0"
-#define MAX_REQUEST_CONTENT_LENGTH 4096 * 4096
 #define HTTP_VERSION_PREFIX        "HTTP/1."
+#define DEFAULT_PORT               "80"
+#define MAX_BACKLOG                5
+#define MAX_REQUEST_CONTENT_LENGTH 4096 * 4096
 
 struct HttpHeaderField {
   char *name;
@@ -37,6 +43,18 @@ struct FileInfo {
   long size;
   bool exists;
 };
+
+static bool debug_mode = false;
+
+static void usage(FILE *restrict f, const char *restrict cmd)
+{
+  fprintf(f, "Udage: %s [-p PORT] [-c -g GROUP -u USER] <DOCROOT>\n", cmd);
+}
+
+static void setup_environment(const char *restrict docroot, const char *restrict group,
+                              const char *restrict user)
+{
+}
 
 static noreturn void log_exit(const char *restrict fmt, ...)
 {
@@ -64,9 +82,54 @@ static noreturn void signal_exit(int sig)
   log_exit("exit by signal %d", sig);
 }
 
+static void detach_children(void (*handler)(int))
+{
+  struct sigaction act;
+  act.sa_handler = handler;
+  sigemptyset(&act.sa_mask);
+  act.sa_flags = SA_RESTART | SA_NOCLDWAIT;
+  if (sigaction(SIGCHLD, &act, NULL) != 0) {
+    log_exit("sigaction(2) failed: %s", strerror(errno));
+  }
+}
+
+static void noop_handler(int sig)
+{
+}
+
 static void install_signal_handlers()
 {
   trap_signal(SIGPIPE, signal_exit);
+  detach_children(noop_handler);
+}
+
+static int listen_socket(const char *port)
+{
+  struct addrinfo hints = { 0 };
+  hints.ai_family = AF_INET;
+  hints.ai_socktype = SOCK_STREAM;
+  hints.ai_flags = AI_PASSIVE;
+  struct addrinfo *res;
+  int err = getaddrinfo(NULL, port, &hints, &res);
+  if (err) {
+    log_exit(gai_strerror(err));
+  }
+  for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
+    int sock = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+    if (sock < 0)
+      continue;
+    if (bind(sock, ai->ai_addr, ai->ai_addrlen) < 0 || listen(sock, MAX_BACKLOG) < 0) {
+      close(sock);
+      continue;
+    }
+    freeaddrinfo(res);
+    return sock;
+  }
+  log_exit("listen_socket failed");
+}
+
+static void become_daemon()
+{
 }
 
 static void upcase(char *s)
@@ -240,11 +303,6 @@ static void output_common_headers(const struct HttpRequest *restrict req, FILE *
   fprintf(out, "Connection: close\r\n");
 }
 
-static char *guess_content_type(const struct FileInfo *fi)
-{
-  return "text/plain";
-}
-
 static void not_found(const struct HttpRequest *req, FILE *out)
 {
   output_common_headers(req, out, "404 Not Found");
@@ -257,6 +315,11 @@ static void not_found(const struct HttpRequest *req, FILE *out)
   fprintf(out, "<head><title>Not Found</title></head>");
   fprintf(out, "<body><h1>404: Not Found</h1></body>");
   fprintf(out, "</html>\n");
+}
+
+static char *guess_content_type(const struct FileInfo *fi)
+{
+  return "text/plain";
 }
 
 static void do_file_response(const struct HttpRequest *restrict req, FILE *restrict out,
@@ -355,13 +418,76 @@ static void service(FILE *restrict in, FILE *restrict out, const char *restrict 
   free_request(req);
 }
 
+static void server_main(int fd, const char *docroot)
+{
+  while (true) {
+    struct sockaddr addr;
+    socklen_t addrlen;
+    int sock = accept(fd, &addr, &addrlen);
+    if (sock < 0) {
+      log_exit("accept(2) failed: %s", strerror(errno));
+    }
+    pid_t pid = fork();
+    if (pid < 0) {
+      log_exit("fork(2) failed: %s", strerror(errno));
+    }
+    if (pid == 0) {
+      FILE *inf = fdopen(sock, "r");
+      FILE *outf = fdopen(sock, "w");
+      service(inf, outf, docroot);
+      exit(EXIT_SUCCESS);
+    }
+    close(sock);
+  }
+}
+
 int main(int argc, char *argv[])
 {
-  if (argc != 2) {
-    fprintf(stderr, "Usage: %s <DOCROOT>\n", argv[0]);
+  bool chroot = false;
+  char *group = NULL;
+  char *user = NULL;
+  char *port = DEFAULT_PORT;
+  int opt;
+  while ((opt = getopt(argc, argv, "Dcg:hp:u:")) != -1) {
+    switch (opt) {
+    case 'D':
+      debug_mode = true;
+      break;
+    case 'c':
+      chroot = true;
+      break;
+    case 'g':
+      group = optarg;
+      break;
+    case 'h':
+      usage(stdout, argv[0]);
+      exit(EXIT_SUCCESS);
+    case 'p':
+      group = optarg;
+      break;
+    case 'u':
+      group = optarg;
+      break;
+    case '?':
+      usage(stderr, argv[0]);
+      exit(EXIT_FAILURE);
+    }
+  }
+  if (optind != argc - 1) {
+    usage(stderr, argv[0]);
     exit(EXIT_FAILURE);
   }
+  char *docroot = argv[optind];
+  if (chroot) {
+    setup_environment(docroot, group, user);
+    docroot = "";
+  }
   install_signal_handlers();
-  service(stdin, stdout, argv[1]);
+  int fd = listen_socket(port);
+  if (!debug_mode) {
+    openlog(SERVER_NAME, LOG_PID | LOG_NDELAY, LOG_DAEMON);
+    become_daemon();
+  }
+  server_main(fd, docroot);
   return EXIT_SUCCESS;
 }
