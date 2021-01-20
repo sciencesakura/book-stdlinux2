@@ -1,6 +1,8 @@
 #include <ctype.h>
 #include <fcntl.h>
+#include <grp.h>
 #include <netdb.h>
+#include <pwd.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdbool.h>
@@ -16,7 +18,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#define SERVER_NAME                "httpd"
+#define SERVER_NAME                "stdlinux2-httpd"
 #define SERVER_VER                 "1.0"
 #define HTTP_VERSION_PREFIX        "HTTP/1."
 #define DEFAULT_PORT               "80"
@@ -51,19 +53,44 @@ static void usage(FILE *restrict f, const char *restrict cmd)
   fprintf(f, "Udage: %s [-p PORT] [-c -g GROUP -u USER] <DOCROOT>\n", cmd);
 }
 
-static void setup_environment(const char *restrict docroot, const char *restrict group,
-                              const char *restrict user)
-{
-}
-
 static noreturn void log_exit(const char *restrict fmt, ...)
 {
   va_list ap;
   va_start(ap, fmt);
-  vfprintf(stderr, fmt, ap);
-  fputc('\n', stderr);
+  if (debug_mode) {
+    vfprintf(stderr, fmt, ap);
+    fputc('\n', stderr);
+  } else {
+    vsyslog(LOG_ERR, fmt, ap);
+  }
   va_end(ap);
   exit(EXIT_FAILURE);
+}
+
+static void setup_environment(const char *restrict docroot, const char *restrict group,
+                              const char *restrict user)
+{
+  if (!group || !user) {
+    log_exit("Specify both of -g and -u");
+  }
+  struct group *grp = getgrnam(group);
+  if (!grp) {
+    log_exit("getgrnam(3) failed: %s", strerror(errno));
+  }
+  if (setgid(grp->gr_gid) < 0) {
+    log_exit("setgid(2) failed");
+  }
+  if (initgroups(user, grp->gr_gid) < 0) {
+    log_exit("initgroups(3) failed: %s", strerror(errno));
+  }
+  struct passwd *pwd = getpwnam(user);
+  if (!pwd) {
+    log_exit("getpwnam(3) failed: %s", strerror(errno));
+  }
+  chroot(docroot);
+  if (setuid(pwd->pw_uid) < 0) {
+    log_exit("setuid(2) failed");
+  }
 }
 
 static void trap_signal(int sig, void (*handler)(int))
@@ -130,6 +157,22 @@ static int listen_socket(const char *port)
 
 static void become_daemon()
 {
+  if (chdir("/") < 0) {
+    log_exit("chdir(2) failed: %s", strerror(errno));
+  }
+  freopen("/dev/null", "r", stdin);
+  freopen("/dev/null", "w", stdout);
+  freopen("/dev/null", "w", stderr);
+  pid_t pid = fork();
+  if (pid < 0) {
+    log_exit("fork(2) failed: %s", strerror(errno));
+  }
+  if (pid != 0) {
+    _exit(EXIT_SUCCESS);
+  }
+  if (setsid() < 0) {
+    log_exit("setsid(2) failed: %s", strerror(errno));
+  }
 }
 
 static void upcase(char *s)
